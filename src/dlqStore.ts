@@ -6,19 +6,28 @@
  * ## Purpose
  * When a webhook delivery fails after all retries, the event is pushed to the
  * DLQ for manual inspection or delayed retry. This module provides an
- * in-memory implementation suitable for single-process deployments.
+ * in-memory implementation suitable for single-process deployments, and a
+ * SQLite-backed implementation for durable, restart-safe persistence.
  *
  * ## Production Considerations
- * For multi-process or persistent DLQ storage, replace `InMemoryDlqStore`
- * with a Redis-backed or database-backed implementation that implements the
- * same `DlqStore` interface.
+ * For multi-process or persistent DLQ storage, use `SqliteDlqStore` which
+ * backs entries in a SQLite database via the existing connection from
+ * `src/db/database.ts`. The in-memory store is suitable for development
+ * and testing only.
  *
  * ## Security
  * DLQ entries may contain sensitive payload data. Ensure that:
- * - Payloads are encrypted at rest if persisted to disk/database.
+ * - Payloads are redacted before storage via `redactPayload` from
+ *   `src/utils/redact.ts` — raw signing secrets are never persisted.
  * - Provider IDs are sanitized before use as metric labels.
- * - Secrets are never included in DLQ entries.
+ * - The database file is excluded from version control and has
+ *   restricted filesystem permissions (chmod 600).
  */
+
+import { getDb } from './db/database';
+import { redactPayload } from './utils/redact';
+import type Database from './db/betterSqlite3';
+import type * as BetterSqlite3 from 'better-sqlite3';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,10 +43,30 @@ export interface DlqEntry {
   deliveryId: string;
   /** Destination URL that failed. */
   targetUrl: string;
-  /** Arbitrary JSON-serialisable payload body. */
+  /** Arbitrary JSON-serialisable payload body. Stored redacted —
+   *  raw signing secrets are stripped by {@link redactPayload}. */
   payload: unknown;
   /** Timestamp (ms since epoch) when the entry was added to the DLQ. */
   timestamp: number;
+  /** Number of enqueue / replay attempts accumulated for this entry. */
+  attemptCount: number;
+}
+
+/**
+ * Options accepted by {@link SqliteDlqStore}.
+ *
+ * @interface SqliteDlqStoreOptions
+ * @property {number} [capacity] - Optional maximum number of entries the
+ *   store will hold. When the store is at capacity, the oldest pending
+ *   entry is evicted before a new one is inserted (oldest-evict policy).
+ *   Defaults to `0` (unbounded).
+ * @property {BetterSqlite3.Database} [db] - Optional explicit database
+ *   handle. When omitted, the singleton from {@link getDb} is used.
+ *   Tests typically pass a `:memory:` database for isolation.
+ */
+export interface SqliteDlqStoreOptions {
+  capacity?: number;
+  db?: BetterSqlite3.Database;
 }
 
 /**
@@ -160,6 +189,31 @@ export class InMemoryDlqStore implements DlqStore {
     }
 
     return drained;
+  }
+
+  /**
+   * Atomically remove up to `replayCap` entries and return them.
+   * If the queue has more than `replayCap` entries, only the oldest `replayCap`
+   * are removed. The removal and cap check happen in a single synchronous step so
+   * concurrent callers (in the same process) cannot observe an intermediate state
+   * where entries are removed but the cap has not yet been enforced.
+   *
+   * @param providerId - Provider whose entries to drain.
+   * @param replayCap - Maximum number of entries to remove in this batch.
+   * @returns Array of removed entries (at most `replayCap`).
+   */
+  public drainWithCap(providerId: string, replayCap: number): DlqEntry[] {
+    if (replayCap <= 0) return [];
+
+    const queue = this.entries.get(providerId);
+    if (!queue || queue.length === 0) return [];
+
+    // Splice is synchronous — read + remove in one operation
+    const batch = queue.splice(0, replayCap);
+    if (queue.length === 0) {
+      this.entries.delete(providerId);
+    }
+    return batch;
   }
 
   /**

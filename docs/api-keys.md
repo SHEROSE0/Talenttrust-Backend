@@ -6,6 +6,20 @@ This document describes the API key authentication system implemented for Talent
 
 API keys provide a secure way for internal services and external integrations to access the TalentTrust API without requiring user authentication. API keys are separate from JWT user authentication and can be used for service-to-service communication.
 
+> **Route mounting note:** The management endpoints described below
+> (`POST/GET /api/v1/api-keys`, `GET/POST/DELETE /api/v1/api-keys/:id`, `.../rotate`)
+> are implemented in [`src/routes/apiKeys.routes.ts`](../src/routes/apiKeys.routes.ts)
+> but are **not currently registered** in [`src/app.ts`](../src/app.ts) or
+> [`src/index.ts`](../src/index.ts). If you are running this backend as-is, mount
+> the router before relying on these endpoints, e.g.:
+> ```ts
+> import apiKeysRouter from './routes/apiKeys.routes';
+> app.use('/api/v1', apiKeysRouter);
+> ```
+> This does not affect *consuming* an existing API key — `authenticateApiKey` /
+> `requireApiKeyScope` / `authenticateEither` are ordinary middleware you can
+> attach to any route regardless of whether the management router is mounted.
+
 ## Admin Scopes
 
 API keys used for admin-only surfaces (DLQ inspection, deploy operations) require one of the following scopes:
@@ -42,7 +56,7 @@ The following endpoints require either a JWT with `admin` role or an API key wit
 
 API keys are 64-character hex strings:
 ```
-abc123def456789012345678901234567890123456789012345678901234567890123456
+0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 ## Usage
@@ -50,7 +64,7 @@ abc123def456789012345678901234567890123456789012345678901234567890123456
 API keys should be sent in the `X-API-Key` header:
 ```http
 GET /api/v1/contracts
-X-API-Key: abc123def456789012345678901234567890123456789012345678901234567890123456
+X-API-Key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 ## Scope Format
@@ -76,10 +90,37 @@ contracts:*        # Can perform any action on contracts
 
 ## API Endpoints
 
+### Authenticating to the management endpoints
+
+The `/api/v1/api-keys*` management endpoints below are protected by
+**user** authentication, not by an API key. They currently use the bearer-token
+scheme implemented in [`src/auth/authenticate.ts`](../src/auth/authenticate.ts)
+(`authenticateMiddleware`) plus the role-based access-control matrix in
+[`src/auth/roles.ts`](../src/auth/roles.ts) (`requirePermission('api-keys', <action>)`)
+— this is the same lightweight scheme documented in the root
+[README's Authentication section](../README.md#authentication) (e.g. the
+`demo-admin-token` / `demo-user-token` bearer values), **not** the production
+JWT stack described in [AUTH.md](../AUTH.md). A token is a base64-encoded
+JSON object of the shape `{ "userId": "u1", "role": "freelancer" }`, sent as
+`Authorization: Bearer <base64-token>`.
+
+Per the current access-control matrix, every role except `auditor` and
+`guest` (`admin`, `freelancer`, `client`) is granted full `create`/`read`/
+`update`/`delete` permission on the `api-keys` resource — so, in practice,
+access is narrowed by **per-key ownership**, not by role: `GET /:id`,
+`POST /:id/rotate`, and `DELETE /:id` all return `403 Access denied` unless
+the authenticated caller's `userId` matches the key's `created_by`, and
+`GET /api/v1/api-keys` only ever lists **active** keys created by the caller
+(other users' keys, and the caller's own deactivated keys, are never
+returned). A deactivated key also stops resolving on `GET /:id`,
+`POST /:id/rotate`, and `DELETE /:id` — those return `404 API key not found`
+rather than a "deactivated" status, because lookups are filtered to
+`is_active` keys.
+
 ### Create API Key
 ```http
 POST /api/v1/api-keys
-Authorization: Bearer <jwt-token>
+Authorization: Bearer <user-token>
 Content-Type: application/json
 
 {
@@ -100,7 +141,8 @@ Content-Type: application/json
     "createdBy": "user-id",
     "createdAt": "2024-01-01T00:00:00Z",
     "expiresAt": "2024-12-31T23:59:59Z",
-    "isActive": true
+    "isActive": true,
+    "callCount": 0
   }
 }
 ```
@@ -108,7 +150,7 @@ Content-Type: application/json
 ### List API Keys
 ```http
 GET /api/v1/api-keys
-Authorization: Bearer <jwt-token>
+Authorization: Bearer <user-token>
 ```
 **Response:**
 ```json
@@ -122,6 +164,7 @@ Authorization: Bearer <jwt-token>
       "updatedAt": "2024-01-01T00:00:00Z",
       "expiresAt": "2024-12-31T23:59:59Z",
       "lastUsedAt": "2024-01-15T10:30:00Z",
+      "callCount": 42,
       "isActive": true
     }
   ],
@@ -132,13 +175,13 @@ Authorization: Bearer <jwt-token>
 ### Get API Key Details
 ```http
 GET /api/v1/api-keys/:id
-Authorization: Bearer <jwt-token>
+Authorization: Bearer <user-token>
 ```
 
 ### Rotate API Key
 ```http
 POST /api/v1/api-keys/:id/rotate
-Authorization: Bearer <jwt-token>
+Authorization: Bearer <user-token>
 ```
 **Response:**
 ```json
@@ -153,7 +196,9 @@ Authorization: Bearer <jwt-token>
     "createdAt": "2024-01-01T00:00:00Z",
     "updatedAt": "2024-01-15T10:30:00Z",
     "expiresAt": "2024-12-31T23:59:59Z",
-    "isActive": true
+    "isActive": true,
+    "callCount": 42,
+    "lastUsedAt": "2024-01-15T10:30:00Z"
   }
 }
 ```
@@ -161,7 +206,7 @@ Authorization: Bearer <jwt-token>
 ### Deactivate API Key
 ```http
 DELETE /api/v1/api-keys/:id
-Authorization: Bearer <jwt-token>
+Authorization: Bearer <user-token>
 ```
 **Response:**
 ```json
@@ -189,8 +234,9 @@ Authorization: Bearer <jwt-token>
 - Expired keys are deactivated on first access attempt
 
 ## Audit Trail
-- Last usage timestamp is updated on successful authentication
-- Helps identify unused or suspicious keys
+- Last usage timestamp and monotonic call count are updated on successful authentication
+- Helps identify unused or suspicious keys and usage patterns
+- Throttled database writes (flushed every 5 seconds) prevent hot keys from thrashing the database
 - Useful for security monitoring and compliance
 
 ## Best Practices
@@ -217,7 +263,7 @@ Authorization: Bearer <jwt-token>
 ## Lifecycle Overview
 
 1. **Creation** – A client calls the `POST /api/v1/api-keys` endpoint. The server generates a cryptographically random 32‑byte key, hashes it with a unique salt using PBKDF2, stores the `salt:hash` pair, and returns the **plain‑text key** **once** in the response. The plain key must be stored securely by the client; it is never persisted by the server.
-2. **Usage** – Clients include the key in the `X‑API‑Key` header on each request. The middleware extracts the header, verifies the key against the stored hash, updates `last_used_at`, and enforces any required scopes via `requireApiKeyScope`.
+2. **Usage** – Clients include the key in the `X‑API‑Key` header on each request. The middleware extracts the header, verifies the key against the stored hash, buffers a call count increment and `last_used_at` update (which flushes asynchronously), and enforces any required scopes via `requireApiKeyScope`.
 3. **Expiration** – If an `expires_at` timestamp is set, the middleware rejects the key after that date, deactivates it on first use after expiry, and returns a 401 error.
 4. **Revocation** – A key can be deactivated at any time via `DELETE /api/v1/api-keys/:id`. The `is_active` flag is cleared, causing subsequent requests to be rejected with a 401.
 5. **Rotation** – To rotate a key, call `POST /api/v1/api-keys/:id/rotate`. A new plain‑text key is returned and the stored hash is replaced. The old key becomes immediately invalid. Update the consuming service's configuration with the new key, verify functionality, and optionally keep the old key for a short rollback window before fully deactivating it.
@@ -244,21 +290,37 @@ Authorization: Bearer <jwt-token>
 
 ## Error Responses
 
-### Authentication Errors
+### Consuming an API key (`authenticateApiKey` / `requireApiKeyScope`)
+
 ```json
 { "error": "Missing X-API-Key header" }
 ```
 ```json
 { "error": "Invalid API key" }
 ```
-### Authorization Errors
 ```json
 { "error": "Forbidden: insufficient API key scope", "required": "contracts:read", "provided": ["users:read"] }
 ```
-### Validation Errors
+
+### Managing keys (`/api/v1/api-keys*` controllers)
+
 ```json
 { "error": "Invalid request body", "required": { "name": "string", "scope": "string[]" } }
 ```
+```json
+{ "error": "Invalid scope format", "invalidScopes": ["bad scope"], "validFormats": ["resource:action", "resource:*", "*:action", "*"] }
+```
+```json
+{ "error": "API key not found" }
+```
+```json
+{ "error": "Access denied" }
+```
+The last one is returned by `GET /:id`, `POST /:id/rotate`, and
+`DELETE /:id` when the authenticated caller did not create the key —
+ownership, not role, gates access to an individual key (see
+["Authenticating to the management endpoints"](#authenticating-to-the-management-endpoints)
+above).
 
 ## Implementation Details
 
@@ -268,6 +330,30 @@ Authorization: Bearer <jwt-token>
 - **Salt Length**: 16 bytes (32 hex chars)
 - **Key Length**: 64 bytes (128 hex chars)
 - **Hash Format**: `salt:hash`
+
+### Stored Credential Validation
+
+The stored `key_hash` field must be a well-formed `salt:hash` string before PBKDF2 verification. This validation runs **before** calling the crypto functions to fail closed on malformed input (e.g., from botched migrations) rather than risking exceptions on the authentication hot path.
+
+**Validation rules:**
+| Check | Requirement |
+|-------|-------------|
+| Non-empty | The stored value must not be empty |
+| Separator | Must contain exactly one colon (`:`) |
+| Parts | Must split into exactly 2 parts (no extra colons) |
+| Salt length | Must be exactly 32 hex characters (16 bytes) |
+| Hash length | Must be exactly 128 hex characters (64 bytes) |
+
+**On invalid format:**
+- Returns `null` (rejects the key)
+- Does NOT throw exceptions
+- Does NOT log the stored hash or salt (surfaces generic "invalid key" result)
+- Preserves existing expiry and `last_used_at` behavior
+
+**Security notes:**
+- Timing-safe comparison (`timingSafeEqual`) is preserved for valid keys
+- The validation runs before PBKDF2 to prevent potential denial-of-service from malformed input
+- No information about the stored format is leaked in error responses
 
 ### Indexed Key Lookup (O(1))
 
@@ -282,7 +368,7 @@ key_selector = SHA-256(plain_api_key)
 1. **Selector computation** — On each request, compute `SHA-256(api_key)` to derive the selector.
 2. **Indexed lookup** — Query the storage layer by `key_selector` to find the candidate row in O(1) instead of scanning all stored keys.
 3. **Salted verification** — The candidate's stored `salt:hash` is verified with PBKDF2 (the same slow salted hash as before). This ensures the selector alone is insufficient to authenticate; an attacker who compromises the selector column still cannot derive the original key or bypass the salted hash.
-4. **Post-validation** — `last_used_at` is updated, expiry is checked (and the key deactivated if expired), and the `ApiKeyInfo` shape is returned.
+4. **Post-validation** — `last_used_at` and `call_count` are updated via a memory buffer, expiry is checked (and the key deactivated if expired), and the `ApiKeyInfo` shape is returned.
 
 **Security properties:**
 | Property | Mechanism |
@@ -307,6 +393,7 @@ interface ApiKey {
   updated_at: Date;
   expires_at?: Date;
   last_used_at?: Date;
+  call_count: number;
   is_active: boolean;
 }
 ```
@@ -331,6 +418,27 @@ app.get('/api/mixed',
   handler
 );
 ```
+
+### JWT-or-key fallback (`authenticateEither`)
+
+`authenticateEither` lets a single route accept **either** a human user (JWT)
+or a service integration (API key), which is useful for endpoints called both
+by the frontend and by internal/external automation. Its precedence is
+header-driven, not a "try both and see":
+
+1. If the request carries an `Authorization: Bearer <token>` header, it is
+   routed to the existing bearer/JWT middleware (`authenticateMiddleware`) —
+   API key headers are ignored in this case, even if also present.
+2. Otherwise, if the request carries an `X-API-Key` header, it is routed to
+   `authenticateApiKey`.
+3. If neither header is present, the request is rejected with `401` and the
+   message `"Authentication required. Provide either Authorization: Bearer <token> or X-API-Key header"`.
+
+Downstream handlers should not assume which path was taken — inspect
+`req.user` (JWT) vs. `req.apiKey` (API key) to know which principal
+authenticated the request. `requireApiKeyScope` only applies scope checks
+when `req.apiKey` is set; pair `authenticateEither` with role/permission
+checks (e.g. `requireRole`) if you also need to gate the JWT path.
 
 ## Migration Guide
 

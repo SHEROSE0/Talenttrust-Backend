@@ -11,6 +11,13 @@ import { getDb } from "../db/database";
 import { ProbeResult } from "./types";
 import { QueueManager } from "../queue/queue-manager";
 import { circuitBreakerRegistry } from "../circuit-breaker/registry";
+import { HealthProbeConfig } from "../appConfiguration";
+
+const DEFAULT_HEALTH_PROBE_CONFIG: Required<HealthProbeConfig> = {
+  queueFailedThreshold: 10,
+  queueBacklogThreshold: 100,
+  queueProbeTimeoutMs: 3_000,
+};
 
 const REDIS_PROBE_TIMEOUT_MS = 3_000;
 
@@ -31,6 +38,7 @@ export async function envProbe(): Promise<ProbeResult> {
   return {
     name: "env",
     ok,
+    status: ok ? "up" : "down",
     detail: ok ? undefined : `Missing vars: ${missing.join(", ")}`,
     latencyMs: Date.now() - start,
   };
@@ -49,6 +57,7 @@ export async function stellarRpcProbe(): Promise<ProbeResult> {
     return {
       name: "stellar-rpc",
       ok: false,
+      status: "down",
       detail: "STELLAR_RPC_URL not set",
       latencyMs: 0,
     };
@@ -66,6 +75,7 @@ export async function stellarRpcProbe(): Promise<ProbeResult> {
     return {
       name: "stellar-rpc",
       ok,
+      status: ok ? "up" : "down",
       detail: ok ? undefined : `HTTP ${res.status}`,
       latencyMs,
     };
@@ -73,6 +83,7 @@ export async function stellarRpcProbe(): Promise<ProbeResult> {
     return {
       name: "stellar-rpc",
       ok: false,
+      status: "down",
       detail: err instanceof Error ? err.message : "unknown error",
       latencyMs: Date.now() - start,
     };
@@ -81,19 +92,63 @@ export async function stellarRpcProbe(): Promise<ProbeResult> {
   }
 }
 
+const DB_PROBE_TIMEOUT_MS = 3_000;
+const DB_PROBE_DEGRADED_THRESHOLD_MS = 1_000;
+
 /**
  * Probe: verify the SQLite database is reachable with a lightweight SELECT 1.
+ * Maps response time to status:
+ * - < 1000ms: up (healthy)
+ * - 1000ms-3000ms: degraded (slow but responding)
+ * - >= 3000ms or error: down (failed or timeout)
+ *
  * Uses the shared singleton returned by {@link getDb}.
+ * Security: Query is hardcoded—no user input.
  */
 export async function dbProbe(): Promise<ProbeResult> {
   const start = Date.now();
   try {
-    getDb().prepare("SELECT 1").run();
-    return { name: "db", ok: true, latencyMs: Date.now() - start };
+    // Store the timer so it can be cancelled once the race settles —
+    // if the DB query wins, the pending timeout must not keep the event
+    // loop alive after the probe resolves.
+    let dbTimerId: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.resolve(getDb().prepare("SELECT 1").run()),
+      new Promise<never>((_, reject) => {
+        dbTimerId = setTimeout(
+          () => reject(new Error("db probe timeout")),
+          DB_PROBE_TIMEOUT_MS,
+        );
+      }),
+    ]).finally(() => {
+      clearTimeout(dbTimerId);
+    });
+
+    const latencyMs = Date.now() - start;
+    
+    if (latencyMs >= DB_PROBE_TIMEOUT_MS) {
+      return {
+        name: "db",
+        ok: false,
+        status: "down",
+        detail: "db probe timeout",
+        latencyMs,
+      };
+    }
+
+    const status = latencyMs > DB_PROBE_DEGRADED_THRESHOLD_MS ? "degraded" : "up";
+    return {
+      name: "db",
+      ok: status === "up",
+      status,
+      detail: status === "degraded" ? `slow response: ${latencyMs}ms` : undefined,
+      latencyMs,
+    };
   } catch (err: unknown) {
     return {
       name: "db",
       ok: false,
+      status: "down",
       detail: err instanceof Error ? err.message : "unknown error",
       latencyMs: Date.now() - start,
     };
@@ -128,11 +183,12 @@ export async function redisProbe(): Promise<ProbeResult> {
   try {
     await client.connect();
     await client.ping();
-    return { name: "redis", ok: true, latencyMs: Date.now() - start };
+    return { name: "redis", ok: true, status: "up", latencyMs: Date.now() - start };
   } catch (err: unknown) {
     return {
       name: "redis",
       ok: false,
+      status: "down",
       detail: err instanceof Error ? err.message : "unknown error",
       latencyMs: Date.now() - start,
     };
@@ -145,39 +201,39 @@ export async function redisProbe(): Promise<ProbeResult> {
   }
 }
 
-const QUEUE_PROBE_TIMEOUT_MS = 3_000;
-
 /**
  * Probe: checks BullMQ queue health via {@link QueueManager.getHealth}.
  *
  * Reports `degraded` when any queue has failed-job count above
- * `QUEUE_FAILED_THRESHOLD` or waiting backlog above `QUEUE_BACKLOG_THRESHOLD`.
- * The probe resolves in at most `QUEUE_PROBE_TIMEOUT_MS` ms.
+ * `config.queueFailedThreshold` or waiting backlog above
+ * `config.queueBacklogThreshold`. The probe resolves in at most
+ * `config.queueProbeTimeoutMs` ms.
  *
- * Thresholds are configurable via env at call time:
- * - `QUEUE_PROBE_TIMEOUT_MS` (default 3000)
- * - `QUEUE_FAILED_THRESHOLD` (default 10)
- * - `QUEUE_BACKLOG_THRESHOLD` (default 100)
+ * @param config - Thresholds and timeout for queue health probing
  */
-export async function queueProbe(): Promise<ProbeResult> {
-  const timeoutMs = parseInt(process.env["QUEUE_PROBE_TIMEOUT_MS"] ?? String(QUEUE_PROBE_TIMEOUT_MS), 10);
-  const failedThreshold = parseInt(process.env["QUEUE_FAILED_THRESHOLD"] ?? "10", 10);
-  const backlogThreshold = parseInt(process.env["QUEUE_BACKLOG_THRESHOLD"] ?? "100", 10);
+export async function queueProbe(config?: HealthProbeConfig): Promise<ProbeResult> {
+  const cfg = { ...DEFAULT_HEALTH_PROBE_CONFIG, ...config };
   const start = Date.now();
   try {
+    let probeTimerId: NodeJS.Timeout | undefined;
     const healthInfos = await Promise.race([
       QueueManager.getInstance().getHealth(),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("queue probe timeout")), timeoutMs)
-      ),
-    ]);
+      new Promise<never>((_, reject) => {
+        probeTimerId = setTimeout(
+          () => reject(new Error("queue probe timeout")),
+          cfg.queueProbeTimeoutMs,
+        );
+      }),
+    ]).finally(() => {
+      clearTimeout(probeTimerId);
+    });
 
     const violations: string[] = [];
     for (const q of healthInfos) {
-      if (q.failed > failedThreshold) {
+      if (q.failed > cfg.queueFailedThreshold) {
         violations.push(`${q.jobType}: ${q.failed} failed jobs`);
       }
-      if (q.waiting > backlogThreshold) {
+      if (q.waiting > cfg.queueBacklogThreshold) {
         violations.push(`${q.jobType}: ${q.waiting} waiting jobs`);
       }
     }
@@ -186,6 +242,7 @@ export async function queueProbe(): Promise<ProbeResult> {
     return {
       name: "queue",
       ok,
+      status: ok ? "up" : "degraded",
       detail: ok ? undefined : violations.join("; "),
       latencyMs: Date.now() - start,
     };
@@ -193,6 +250,7 @@ export async function queueProbe(): Promise<ProbeResult> {
     return {
       name: "queue",
       ok: false,
+      status: "down",
       detail: err instanceof Error ? err.message : "unknown error",
       latencyMs: Date.now() - start,
     };
@@ -215,6 +273,7 @@ export async function circuitBreakerProbe(): Promise<ProbeResult> {
     return {
       name: "circuit-breaker",
       ok,
+      status: ok ? "up" : "degraded",
       detail: ok ? undefined : `${openCount} breaker(s) open`,
       latencyMs: Date.now() - start,
     };
@@ -222,6 +281,7 @@ export async function circuitBreakerProbe(): Promise<ProbeResult> {
     return {
       name: "circuit-breaker",
       ok: false,
+      status: "down",
       detail: err instanceof Error ? err.message : "unknown error",
       latencyMs: Date.now() - start,
     };

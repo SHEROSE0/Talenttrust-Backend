@@ -6,8 +6,10 @@ import {
   encodeCursor,
   decodeCursor,
   parseLimit,
+  resolveCursorQueryParam,
 } from './cursor.repository';
-import { CURSOR_MAX_LIMIT, CURSOR_DEFAULT_LIMIT } from './cursor.types';
+import { InMemoryCursorRepository } from './cursor.repository';
+import { CURSOR_MAX_LIMIT, CURSOR_DEFAULT_LIMIT, CURSOR_MAX_LENGTH } from './cursor.types';
 
 describe('encodeCursor / decodeCursor', () => {
   const position = { createdAt: '2024-06-01T12:00:00.000Z', id: 'abc-123' };
@@ -16,6 +18,7 @@ describe('encodeCursor / decodeCursor', () => {
     const cursor = encodeCursor(position);
     expect(typeof cursor).toBe('string');
     expect(cursor.length).toBeGreaterThan(0);
+    expect(cursor.length).toBeLessThanOrEqual(CURSOR_MAX_LENGTH);
     const decoded = decodeCursor(cursor);
     expect(decoded).toEqual(position);
   });
@@ -29,6 +32,31 @@ describe('encodeCursor / decodeCursor', () => {
     expect(() => decodeCursor('not-base64-json')).toThrow(
       /invalid pagination cursor/i,
     );
+  });
+
+  it('throws if cursor length exceeds CURSOR_MAX_LENGTH', () => {
+    const oversizedCursor = 'a'.repeat(CURSOR_MAX_LENGTH + 1);
+    expect(() => decodeCursor(oversizedCursor)).toThrow(/invalid pagination cursor/i);
+  });
+
+  it('throws if cursor contains characters outside the base64url charset', () => {
+    const validCursor = encodeCursor(position);
+    
+    // Add invalid chars one by one
+    expect(() => decodeCursor(validCursor + '=')).toThrow(/invalid pagination cursor/i);
+    expect(() => decodeCursor(validCursor + '/')).toThrow(/invalid pagination cursor/i);
+    expect(() => decodeCursor(validCursor + '+')).toThrow(/invalid pagination cursor/i);
+    expect(() => decodeCursor(' ' + validCursor)).toThrow(/invalid pagination cursor/i);
+    expect(() => decodeCursor(validCursor + '!')).toThrow(/invalid pagination cursor/i);
+  });
+
+  it('accepts cursor at exactly CURSOR_MAX_LENGTH if valid base64url', () => {
+    // Note: since it's hard to make a valid JSON object that encodes exactly to 256 base64url chars
+    // without actually doing parsing, we can just ensure that if the size is exactly at max
+    // AND it fails later in JSON parsing, it throws the specific JSON parse error
+    // instead of the malformed error from the length guard.
+    const maxCursor = 'a'.repeat(CURSOR_MAX_LENGTH);
+    expect(() => decodeCursor(maxCursor)).toThrow(/invalid pagination cursor: cannot decode/i);
   });
 
   it('throws on valid base64 that is not JSON', () => {
@@ -118,7 +146,8 @@ describe('parseLimit', () => {
 
   it('throws when limit is a float string that truncates to 0', () => {
     expect(() => parseLimit('0.9')).toThrow(/positive integer/i);
-import { InMemoryCursorRepository } from './cursor.repository';
+  });
+});
 
 describe('InMemoryCursorRepository', () => {
   it('returns null for non-existent cursor', async () => {
@@ -214,5 +243,54 @@ describe('InMemoryCursorRepository', () => {
 
     expect(cursorA!.lastSequence).toBe(150);
     expect(cursorB!.lastSequence).toBe(200);
+  });
+});
+
+describe('resolveCursorQueryParam', () => {
+  const position = { createdAt: '2024-06-01T12:00:00.000Z', id: 'abc-123' };
+
+  it('returns ok with cursor undefined when no cursor is supplied', () => {
+    const result = resolveCursorQueryParam(undefined);
+    expect(result).toEqual({ ok: true, cursor: undefined });
+  });
+
+  it('returns ok with cursor undefined for an empty string', () => {
+    const result = resolveCursorQueryParam('');
+    expect(result).toEqual({ ok: true, cursor: undefined });
+  });
+
+  it('returns ok with the cursor echoed back when it decodes successfully', () => {
+    const cursor = encodeCursor(position);
+    const result = resolveCursorQueryParam(cursor);
+    expect(result).toEqual({ ok: true, cursor });
+  });
+
+  it('returns ok:false with decodeCursor\'s message for a malformed cursor', () => {
+    const result = resolveCursorQueryParam('not-a-valid-cursor');
+    expect(result.ok).toBe(false);
+    expect((result as { ok: false; message: string }).message).toMatch(/invalid pagination cursor/i);
+  });
+
+  it('returns ok:false for a cursor missing a required field, matching decodeCursor directly', () => {
+    const bad = Buffer.from(
+      JSON.stringify({ createdAt: '2024-01-01T00:00:00.000Z' }),
+      'utf8',
+    ).toString('base64url');
+
+    const result = resolveCursorQueryParam(bad);
+    expect(result.ok).toBe(false);
+
+    let expectedMessage = '';
+    try {
+      decodeCursor(bad);
+    } catch (err) {
+      expectedMessage = (err as Error).message;
+    }
+    expect((result as { ok: false; message: string }).message).toBe(expectedMessage);
+  });
+
+  it('treats a non-string raw value (e.g. an array from a duplicated query param) as absent', () => {
+    const result = resolveCursorQueryParam(['a', 'b']);
+    expect(result).toEqual({ ok: true, cursor: undefined });
   });
 });

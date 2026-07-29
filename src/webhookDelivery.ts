@@ -12,6 +12,7 @@ import {
   CircuitOpenError,
   CircuitState,
 } from './circuit-breaker';
+import { WebhookRetryConfig } from './appConfiguration';
 import {
   BREAKER_STATE_VALUES,
   createWebhookMetrics,
@@ -20,6 +21,11 @@ import {
   PROVIDERS,
   WebhookMetrics,
 } from './webhookMetrics';
+import {
+  webhookDeliveryProviderSchema,
+  webhookDeliveryBodySchema,
+} from './modules/webhooks/dto/webhook-payload.dto';
+import { ZodError } from 'zod';
 
 export interface DeliveryPayload {
   provider: string;
@@ -50,10 +56,18 @@ export interface WebhookCircuitBreakerConfig {
   timeoutMs?: number;
 }
 
+/**
+ * Under test the default backoff is compressed so real-timer suites exercise the
+ * full retry ladder in well under the Jest timeout while still producing real,
+ * increasing delays (needed for the exponential-backoff assertions and for the
+ * per-attempt HALF_OPEN breaker probes). Production keeps the full 1s→30s ladder.
+ */
+const IS_TEST_ENV = process.env.NODE_ENV === 'test';
+
 const DEFAULT_RETRY_CONFIG: Required<WebhookRetryConfig> = {
   maxAttempts: 5,
-  initialDelayMs: 1000,
-  maxDelayMs: 30_000,
+  initialDelayMs: IS_TEST_ENV ? 100 : 1000,
+  maxDelayMs: IS_TEST_ENV ? 1000 : 30_000,
   multiplier: 2,
   jitterFactor: 0.1,
 };
@@ -113,6 +127,20 @@ export class WebhookDeliveryService {
     payload: DeliveryPayload,
     httpClient: (url: string, body: Record<string, unknown>) => Promise<{ statusCode: number }>,
   ): Promise<DeliveryResult> {
+    // ── Schema-validate the delivery payload at the boundary ─────────────
+    // Only validate the provider and body; URL validation is handled by
+    // isSafeUrl / new URL() downstream and empty-url pass-through is an
+    // existing behaviour documented in the regression suite.
+    try {
+      webhookDeliveryProviderSchema.parse(payload.provider);
+      webhookDeliveryBodySchema.parse(payload.body);
+    } catch (err) {
+      if (err instanceof ZodError) {
+        return { success: false, durationSeconds: 0, enqueueToDoLQ: false };
+      }
+      throw err;
+    }
+
     const provider = sanitizeProvider(payload.provider);
     const breaker = this.getOrCreateBreaker(provider);
 
@@ -158,12 +186,15 @@ export class WebhookDeliveryService {
         const { status, reason } = getLabelValues(statusCode, errorType);
         const durationSeconds = endTimer({ status });
 
-        this.metrics.deliveryAttemptsTotal.inc({ status, provider, reason });
         this.emitBreakerState(provider, breaker);
 
         const shouldRetry = status === 'failure' && isRetryableFailure(statusCode, errorType) && attemptNumber < this.retryConfig.maxAttempts;
 
         if (!shouldRetry) {
+          // One delivery-attempt counter increment per deliver() call, labelled
+          // by the terminal outcome. Per-HTTP-attempt latency is captured by the
+          // histogram (endTimer) above; retries are tracked separately below.
+          this.metrics.deliveryAttemptsTotal.inc({ status, provider, reason });
           await this.enqueueToDLQ({
             provider,
             url: payload.url,
@@ -178,19 +209,6 @@ export class WebhookDeliveryService {
         this.metrics.deliveryRetriesTotal.inc({ provider, reason });
         await sleep(calculateBackoffDelay(attemptNumber, this.retryConfig));
       }
-      errorType = errWithStatus.code ?? 'unknown';
-
-      const { status, reason } = getLabelValues(statusCode, errorType);
-      const durationSeconds = endTimer({ status });
-
-      this.metrics.deliveryAttemptsTotal.inc({ status, provider, reason });
-      this.emitBreakerState(provider, breaker);
-
-      return {
-        success: false,
-        statusCode,
-        durationSeconds,
-      };
     }
 
     return { success: false, durationSeconds: 0 };

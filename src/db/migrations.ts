@@ -18,6 +18,13 @@ const MIGRATIONS: Migration[] = [
   {
     version: 1,
     name: "create_users_and_contracts_schema",
+    checksumSource: [
+      "CREATE TABLE IF NOT EXISTS users (",
+      "CREATE TABLE IF NOT EXISTS contracts (",
+      "CREATE INDEX IF NOT EXISTS idx_contracts_client_id",
+      "CREATE INDEX IF NOT EXISTS idx_contracts_freelancer_id",
+      "CREATE INDEX IF NOT EXISTS idx_contracts_status",
+    ].join("\n"),
     up: (db) => {
       db.exec(`
         CREATE TABLE IF NOT EXISTS users (
@@ -56,12 +63,17 @@ const MIGRATIONS: Migration[] = [
   {
     version: 2,
     name: "add_contract_version_column",
+    checksumSource: [
+      "ALTER TABLE contracts ADD COLUMN version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0)",
+    ].join("\n"),
     up: (db) => {
-      const columns = db.pragma("table_info(contracts)") as Array<{ name: string }>;
+      const columns = db.pragma("table_info(contracts)") as Array<{
+        name: string;
+      }>;
       const hasVersion = columns.some((col) => col.name === "version");
       if (!hasVersion) {
         db.exec(
-          "ALTER TABLE contracts ADD COLUMN version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0)"
+          "ALTER TABLE contracts ADD COLUMN version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0)",
         );
       }
     },
@@ -69,22 +81,23 @@ const MIGRATIONS: Migration[] = [
   {
     version: 3,
     name: "create_smart_contract_events_table",
-  checksumSource: [
-    "CREATE TABLE IF NOT EXISTS smart_contract_events (",
-    "UNIQUE(contractId, eventType, idempotencyKey)",
-  ].join("\n"),
-  up: (db) => {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS smart_contract_events (
-        eventId TEXT PRIMARY KEY,
-        contractId TEXT NOT NULL,
-        eventType TEXT NOT NULL,
-        idempotencyKey TEXT,
-        payload TEXT,
-        timestamp TEXT NOT NULL,
-        UNIQUE(contractId, eventType, idempotencyKey)
-      );
-    `);
+    checksumSource: [
+      "CREATE TABLE IF NOT EXISTS smart_contract_events (",
+      "UNIQUE(contractId, eventType, idempotencyKey)",
+    ].join("\n"),
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS smart_contract_events (
+          eventId TEXT PRIMARY KEY,
+          contractId TEXT NOT NULL,
+          eventType TEXT NOT NULL,
+          idempotencyKey TEXT,
+          payload TEXT,
+          timestamp TEXT NOT NULL,
+          UNIQUE(contractId, eventType, idempotencyKey)
+        );
+      `);
+    },
   },
   {
     version: 4,
@@ -115,31 +128,33 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
-},
-{
-  version: 5,
-  name: "create_transactions_table",
-  checksumSource: [
-    "CREATE TABLE IF NOT EXISTS transactions (",
-  ].join("\n"),
-  up: (db) => {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS transactions (
-        hash            TEXT    PRIMARY KEY,
-        status          TEXT    NOT NULL,
-        receipt         TEXT,
-        last_checked_at TEXT,
-        retry_count     INTEGER NOT NULL DEFAULT 0
-      );
-    `);
+  {
+    version: 5,
+    name: "create_transactions_table",
+    checksumSource: ["CREATE TABLE IF NOT EXISTS transactions ("].join("\n"),
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS transactions (
+          hash            TEXT    PRIMARY KEY,
+          status          TEXT    NOT NULL,
+          receipt         TEXT,
+          last_checked_at TEXT,
+          retry_count     INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+    },
   },
-},
 ];
 
 // Version 6: deployment_history table
 MIGRATIONS.push({
   version: 6,
   name: "create_deployment_history_table",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS deployment_history (",
+    "CREATE INDEX IF NOT EXISTS idx_deployment_history_env_from",
+    "CREATE INDEX IF NOT EXISTS idx_deployment_history_env_to",
+  ].join("\n"),
   up: (db) => {
     db.exec(`
       CREATE TABLE IF NOT EXISTS deployment_history (
@@ -160,10 +175,76 @@ MIGRATIONS.push({
   },
 });
 
-// Version 7: retention storage tables for the SqliteStorageProvider
+// Version 7: add password_hash and refresh_token_hash columns for authentication
 MIGRATIONS.push({
   version: 7,
+  name: "add_auth_columns_to_users",
+  checksumSource: [
+    "DROP TABLE IF EXISTS users",
+    "CREATE TABLE users (password_hash TEXT, refresh_token_hash TEXT)",
+    "INSERT INTO users (id, username, email, role, password_hash, refresh_token_hash, created_at)",
+  ].join("\n"),
+  up: (db) => {
+    const columns = db.pragma("table_info(users)") as Array<{ name: string }>;
+    const hasPasswordHash = columns.some((col) => col.name === "password_hash");
+    const hasRefreshTokenHash = columns.some(
+      (col) => col.name === "refresh_token_hash",
+    );
+
+    if (!hasPasswordHash || !hasRefreshTokenHash) {
+      // Backup existing data
+      const users = db.prepare("SELECT * FROM users").all() as Array<
+        Record<string, unknown>
+      >;
+
+      // Drop old table
+      db.exec("DROP TABLE IF EXISTS users");
+
+      // Create new table with auth columns
+      db.exec(`
+        CREATE TABLE users (
+          id              TEXT    PRIMARY KEY,
+          username        TEXT    NOT NULL UNIQUE,
+          email           TEXT    NOT NULL UNIQUE,
+          role            TEXT    NOT NULL DEFAULT 'client'
+                                  CHECK (role IN ('client', 'freelancer', 'both')),
+          password_hash   TEXT,
+          refresh_token_hash TEXT,
+          created_at      TEXT    NOT NULL
+        )
+      `);
+
+      // Restore data if it existed
+      if (users.length > 0) {
+        const insertStmt = db.prepare(`
+          INSERT INTO users (id, username, email, role, password_hash, refresh_token_hash, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        for (const user of users) {
+          insertStmt.run(
+            user.id,
+            user.username,
+            user.email,
+            user.role,
+            user.password_hash ?? null,
+            user.refresh_token_hash ?? null,
+            user.created_at,
+          );
+        }
+      }
+    }
+  },
+});
+
+// Version 8: retention storage tables for the SqliteStorageProvider
+MIGRATIONS.push({
+  version: 8,
   name: "create_retention_storage_tables",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS retention_local (",
+    "CREATE TABLE IF NOT EXISTS retention_archive (",
+  ].join("\n"),
   up: (db) => {
     // The retention module uses two independent provider instances (local + archive),
     // so we create two physically separate tables rather than a single table with a
@@ -200,6 +281,99 @@ MIGRATIONS.push({
   },
 });
 
+// Version 9: add started_at to transactions table
+MIGRATIONS.push({
+  version: 9,
+  name: "add_started_at_to_transactions",
+  checksumSource: ["ALTER TABLE transactions ADD COLUMN started_at TEXT"].join(
+    "\n",
+  ),
+  up: (db) => {
+    // Check if the column already exists to prevent errors during repeated migrations
+    const columns = db.pragma("table_info(transactions)") as Array<{
+      name: string;
+    }>;
+    const hasStartedAt = columns.some((column) => column.name === "started_at");
+
+    if (!hasStartedAt) {
+      db.exec("ALTER TABLE transactions ADD COLUMN started_at TEXT");
+    }
+  },
+});
+
+// Version 10: webhook_subscriptions table
+MIGRATIONS.push({
+  version: 10,
+  name: "create_webhook_subscriptions_table",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS webhook_subscriptions (",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_consumer",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_event",
+  ].join("\n"),
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id TEXT PRIMARY KEY,
+        consumer_id TEXT,
+        url TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        secret TEXT,
+        active BOOLEAN DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_consumer ON webhook_subscriptions(consumer_id);
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_event ON webhook_subscriptions(event_type);
+    `);
+  },
+});
+
+// Version 11: enforce uniqueness on the normalized (trimmed + lowercased) email
+MIGRATIONS.push({
+  version: 11,
+  name: "add_normalized_email_unique_index",
+  checksumSource: [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_normalized ON users (lower(trim(email)))",
+  ].join("\n"),
+  up: (db) => {
+    // Duplicate emails that differ only by surrounding whitespace or letter
+    // case must be rejected. A plain UNIQUE(email) constraint compares the raw
+    // stored value, so 'alice@example.com' and '  Alice@Example.COM  ' would be
+    // treated as distinct. An expression index over lower(trim(email)) makes the
+    // normalized form the uniqueness key.
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_normalized
+        ON users (lower(trim(email)));
+    `);
+  },
+});
+
+// Version 12: notifications table backing the NotificationRepository
+MIGRATIONS.push({
+  version: 12,
+  name: "create_notifications_table",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS notifications (",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_user_id",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_created_at",
+  ].join("\n"),
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL,
+        title       TEXT NOT NULL,
+        message     TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_id
+        ON notifications(user_id);
+      CREATE INDEX IF NOT EXISTS idx_notifications_created_at
+        ON notifications(created_at);
+    `);
+  },
+});
+
 function ensureMigrationTable(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_version (
@@ -210,7 +384,9 @@ function ensureMigrationTable(db: Database.Database): void {
     );
   `);
 
-  const columns = db.pragma("table_info(schema_version)") as Array<{ name: string }>;
+  const columns = db.pragma("table_info(schema_version)") as Array<{
+    name: string;
+  }>;
   const hasChecksum = columns.some((column) => column.name === "checksum");
 
   if (!hasChecksum) {
@@ -218,10 +394,12 @@ function ensureMigrationTable(db: Database.Database): void {
   }
 }
 
-function getAppliedMigrations(db: Database.Database): Map<number, AppliedMigration> {
+function getAppliedMigrations(
+  db: Database.Database,
+): Map<number, AppliedMigration> {
   const rows = db
     .prepare<[], AppliedMigration>(
-      "SELECT version, name, checksum FROM schema_version ORDER BY version ASC"
+      "SELECT version, name, checksum FROM schema_version ORDER BY version ASC",
     )
     .all();
 
@@ -235,7 +413,7 @@ function assertMigrationsAreValid(migrations: Migration[]): void {
 
     if (migration?.version !== expectedVersion) {
       throw new Error(
-        `Invalid migration sequence: expected version ${expectedVersion}, got ${migration?.version}`
+        `Invalid migration sequence: expected version ${expectedVersion}, got ${migration?.version}`,
       );
     }
   }
@@ -274,28 +452,34 @@ export function computeMigrationChecksum(migration: Migration): string {
  * Returns `null` when the migration has no `checksumSource` — in that case
  * the legacy and current fingerprints are identical and no upgrade is needed.
  */
-export function computeLegacyMigrationChecksum(migration: Migration): string | null {
+export function computeLegacyMigrationChecksum(
+  migration: Migration,
+): string | null {
   if (migration.checksumSource === undefined) {
     return null;
   }
   return createHash("sha256")
-    .update(`${migration.version}\n${migration.name}\n${source}`)
+    .update(
+      `${migration.version}\n${migration.name}\n${migration.up.toString()}`,
+    )
     .digest("hex");
 }
 
 function verifyAppliedMigrations(
   db: Database.Database,
   appliedMigrations: Map<number, AppliedMigration>,
-  migrations: Migration[]
+  migrations: Migration[],
 ): void {
-  const migrationsByVersion = new Map(migrations.map((migration) => [migration.version, migration]));
+  const migrationsByVersion = new Map(
+    migrations.map((migration) => [migration.version, migration]),
+  );
 
   for (const applied of appliedMigrations.values()) {
     const migration = migrationsByVersion.get(applied.version);
 
     if (!migration) {
       throw new Error(
-        `Applied migration ${applied.version} (${applied.name}) is not present in the migration list`
+        `Applied migration ${applied.version} (${applied.name}) is not present in the migration list`,
       );
     }
 
@@ -303,14 +487,14 @@ function verifyAppliedMigrations(
 
     if (applied.name !== migration.name) {
       throw new Error(
-        `Applied migration ${applied.version} name mismatch: expected ${migration.name}, got ${applied.name}`
+        `Applied migration ${applied.version} name mismatch: expected ${migration.name}, got ${applied.name}`,
       );
     }
 
     if (applied.checksum === null) {
       // Backfill: row predates checksum tracking
       db.prepare<[string, number]>(
-        "UPDATE schema_version SET checksum = ? WHERE version = ?"
+        "UPDATE schema_version SET checksum = ? WHERE version = ?",
       ).run(expectedChecksum, applied.version);
       applied.checksum = expectedChecksum;
       continue;
@@ -325,14 +509,14 @@ function verifyAppliedMigrations(
       const legacyChecksum = computeLegacyMigrationChecksum(migration);
       if (legacyChecksum !== null && applied.checksum === legacyChecksum) {
         db.prepare<[string, number]>(
-          "UPDATE schema_version SET checksum = ? WHERE version = ?"
+          "UPDATE schema_version SET checksum = ? WHERE version = ?",
         ).run(expectedChecksum, applied.version);
         applied.checksum = expectedChecksum;
         continue;
       }
 
       throw new Error(
-        `Applied migration ${applied.version} checksum mismatch; refusing to start`
+        `Applied migration ${applied.version} checksum mismatch; refusing to start`,
       );
     }
   }
@@ -352,7 +536,7 @@ function verifyAppliedMigrations(
  */
 export function runMigrations(
   db: Database.Database,
-  migrations: Migration[] = MIGRATIONS
+  migrations: Migration[] = MIGRATIONS,
 ): void {
   assertMigrationsAreValid(migrations);
   ensureMigrationTable(db);
@@ -361,7 +545,7 @@ export function runMigrations(
   verifyAppliedMigrations(db, appliedMigrations, migrations);
 
   const insertApplied = db.prepare<[number, string, string, string]>(
-    "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)"
+    "INSERT INTO schema_version (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
   );
 
   for (const migration of migrations) {
@@ -375,7 +559,7 @@ export function runMigrations(
         migration.version,
         migration.name,
         computeMigrationChecksum(migration),
-        new Date().toISOString()
+        new Date().toISOString(),
       );
     });
 
@@ -386,3 +570,67 @@ export function runMigrations(
 export function getLatestSchemaVersion(): number {
   return MIGRATIONS[MIGRATIONS.length - 1]?.version ?? 0;
 }
+
+// Version 13: DLQ storage tables
+MIGRATIONS.push({
+  version: 13,
+  name: "create_webhook_dlq_tables",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS webhook_dlq (",
+    "id TEXT PRIMARY KEY,",
+    "webhook_id TEXT NOT NULL,",
+    "url TEXT NOT NULL,",
+    "body TEXT NOT NULL,",
+    "retry_count INTEGER NOT NULL DEFAULT 0,",
+    "webhook_secret TEXT,",
+    "failed_at TEXT NOT NULL,",
+    "last_error TEXT NOT NULL,",
+    "dedupe_key TEXT NOT NULL,",
+    "replayed_at TEXT,",
+    "replay_attempts INTEGER NOT NULL DEFAULT 0,",
+    "created_at TEXT NOT NULL,",
+    "updated_at TEXT NOT NULL",
+    "UNIQUE(dedupe_key)",
+  ].join("\n"),
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS webhook_dlq (
+        id TEXT PRIMARY KEY,
+        webhook_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        body TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        webhook_secret TEXT,
+        failed_at TEXT NOT NULL,
+        last_error TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        replayed_at TEXT,
+        replay_attempts INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_webhook_dlq_failed_at ON webhook_dlq(failed_at);
+      CREATE INDEX IF NOT EXISTS idx_webhook_dlq_dedupe_key ON webhook_dlq(dedupe_key);
+    `);
+  },
+});
+
+// Version 14: add call_count to api_keys
+MIGRATIONS.push({
+  version: 14,
+  name: "add_call_count_to_api_keys",
+  checksumSource: [
+    "ALTER TABLE api_keys ADD COLUMN call_count INTEGER NOT NULL DEFAULT 0",
+  ].join("\n"),
+  up: (db) => {
+    // Check if the column already exists to prevent errors during repeated migrations
+    const columns = db.pragma("table_info(api_keys)") as Array<{
+      name: string;
+    }>;
+    const hasCallCount = columns.some((column) => column.name === "call_count");
+
+    if (!hasCallCount) {
+      db.exec("ALTER TABLE api_keys ADD COLUMN call_count INTEGER NOT NULL DEFAULT 0");
+    }
+  },
+});

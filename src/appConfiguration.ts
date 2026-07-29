@@ -21,6 +21,12 @@ export interface WebhookRetryConfig {
   jitterFactor: number;
 }
 
+export interface HealthProbeConfig {
+  queueFailedThreshold: number;
+  queueBacklogThreshold: number;
+  queueProbeTimeoutMs: number;
+}
+
 export interface AppConfig {
   port: number;
   gracefulDegradationEnabled: boolean;
@@ -37,6 +43,15 @@ export interface AppConfig {
    * webhook and RPC failure modes can be tuned independently.
    */
   webhookCircuitBreaker: CircuitBreakerConfig;
+  healthProbes: HealthProbeConfig;
+  idempotencyTtlMs: number;
+  allowedAssets: string[];
+  /**
+   * When `true` (default), milestones are validated and enforced through the
+   * contracts API. When `false`, milestone fields are stripped from incoming
+   * requests so the feature is entirely disabled at runtime without a deploy.
+   */
+  milestonesEnabled: boolean;
 }
 
 const MAX_TIMEOUT_MS = 10_000;
@@ -97,6 +112,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const port = clamp(toNumber(env.PORT, 3001), 1, 65535);
   const upstreamTimeoutMs = clamp(toNumber(env.UPSTREAM_TIMEOUT_MS, 1200), MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
   const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
+  const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
 
   return {
     port,
@@ -109,7 +125,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       return url;
     })(),
     upstreamTimeoutMs,
-
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
     chaosProbability,
@@ -130,5 +145,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       successThreshold: clamp(toNumber(env.WEBHOOK_CB_SUCCESS_THRESHOLD, 1), 1, 20),
       timeoutMs: clamp(toNumber(env.WEBHOOK_CB_TIMEOUT_MS, 60_000), 1_000, 300_000),
     },
+    healthProbes: {
+      queueFailedThreshold: clamp(toNumber(env.QUEUE_FAILED_THRESHOLD, 10), 0, 10_000),
+      queueBacklogThreshold: clamp(toNumber(env.QUEUE_BACKLOG_THRESHOLD, 100), 0, 1_000_000),
+      queueProbeTimeoutMs: clamp(toNumber(env.QUEUE_PROBE_TIMEOUT_MS, 3_000), 100, 30_000),
+    },
+    idempotencyTtlMs,
+    allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
+    milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
 }

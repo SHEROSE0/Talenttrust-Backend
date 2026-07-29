@@ -4,6 +4,7 @@ import axios from 'axios';
 import { createWebhookSignature } from '../utils/webhook-signing.util';
 import * as ssrf from '../utils/ssrf';
 import { RateLimitStore } from '../lib/rateLimitStore';
+import { WEBHOOK_RETRY_POLICY } from '../queue/webhook-retry-policy';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -36,11 +37,13 @@ describe('WebhookService', () => {
     expect(mockedAxios.post).toHaveBeenCalledWith(
       'http://test.com',
       { event: 'test', data: {} },
-      {
+      // objectContaining tolerates the per-request `timeout` option, which the
+      // webhook.service.iterative suite (same source) requires to be present.
+      expect.objectContaining({
         headers: {
           'Content-Type': 'application/json'
         }
-      }
+      })
     );
   });
 
@@ -74,13 +77,15 @@ describe('WebhookService', () => {
     expect(mockedAxios.post).toHaveBeenCalledWith(
       'http://test.com',
       { event: 'test', data: {} },
-      {
+      // objectContaining tolerates the per-request `timeout` option, which the
+      // webhook.service.iterative suite (same source) requires to be present.
+      expect.objectContaining({
         headers: {
           'Content-Type': 'application/json',
           'X-Signature': mockSignature,
           'X-Timestamp': mockTimestamp.toString()
         }
-      }
+      })
     );
   });
 
@@ -103,17 +108,20 @@ describe('WebhookService', () => {
       webhookSecret: 'test-secret'
     };
 
+    // The bounded retry loop (webhook.service.iterative architecture) attempts
+    // maxRetries + 1 times within a single send(), re-signing on every attempt.
+    // Drive all backoff timers to completion so the loop resolves.
     jest.useFakeTimers();
     try {
       const sendOp = service.send(payload);
 
-      // Run the first retry
-      await jest.runOnlyPendingTimersAsync();
+      await jest.runAllTimersAsync();
 
       await sendOp;
 
-      expect(mockedCreateWebhookSignature).toHaveBeenCalledTimes(2); // Initial + 1 retry
-      expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+      const expectedAttempts = WEBHOOK_RETRY_POLICY.maxRetries + 1;
+      expect(mockedCreateWebhookSignature).toHaveBeenCalledTimes(expectedAttempts);
+      expect(mockedAxios.post).toHaveBeenCalledTimes(expectedAttempts);
     } finally {
       jest.useRealTimers();
     }
@@ -458,5 +466,112 @@ describe('WebhookService per-host rate limiting', () => {
     // isSafeUrl called once; axios never called
     expect(mockedIsSafeUrl).toHaveBeenCalledTimes(1);
     expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Payload size validation tests.
+ */
+describe('WebhookService payload size validation', () => {
+  const ORIG_ENV = process.env;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedIsSafeUrl.mockReturnValue(true);
+    // Set a small limit for testing (10KB)
+    process.env = { ...ORIG_ENV, WEBHOOK_MAX_PAYLOAD_SIZE_BYTES: '10240' };
+  });
+
+  afterEach(() => {
+    process.env = ORIG_ENV;
+  });
+
+  it('accepts payload within size limit', async () => {
+    mockedAxios.post.mockResolvedValue({ status: 200 });
+
+    const service = new WebhookService();
+    const smallData = { event: 'test', data: 'small payload' };
+
+    // Should not throw for small payload
+    await expect(
+      service.trigger('test.event', smallData)
+    ).resolves.not.toThrow();
+  });
+
+  it('rejects payload exceeding size limit', async () => {
+    const service = new WebhookService();
+    // Create a payload larger than 10KB
+    const largeData = { event: 'test', data: 'x'.repeat(15000) };
+
+    await expect(
+      service.trigger('test.event', largeData)
+    ).rejects.toThrow('Webhook payload size');
+  });
+
+  it('includes actual and max size in error message', async () => {
+    const service = new WebhookService();
+    const largeData = { event: 'test', data: 'x'.repeat(15000) };
+
+    try {
+      await service.trigger('test.event', largeData);
+      fail('Should have thrown');
+    } catch (error) {
+      expect((error as Error).message).toMatch(/exceeds maximum allowed size/);
+      expect((error as Error).message).toMatch(/bytes/);
+    }
+  });
+
+  it('validates payload size before any delivery attempts', async () => {
+    const service = new WebhookService();
+    const largeData = { event: 'test', data: 'x'.repeat(15000) };
+
+    try {
+      await service.trigger('test.event', largeData);
+    } catch (error) {
+      // Should not attempt any deliveries
+      expect(mockedAxios.post).not.toHaveBeenCalled();
+    }
+  });
+
+  it('handles empty payload', async () => {
+    mockedAxios.post.mockResolvedValue({ status: 200 });
+
+    const service = new WebhookService();
+    const emptyData = {};
+
+    await expect(
+      service.trigger('test.event', emptyData)
+    ).resolves.not.toThrow();
+  });
+
+  it('handles complex nested payload within limit', async () => {
+    mockedAxios.post.mockResolvedValue({ status: 200 });
+
+    const service = new WebhookService();
+    const complexData = {
+      event: 'complex',
+      nested: {
+        level1: {
+          level2: {
+            data: 'test',
+            array: [1, 2, 3, 4, 5]
+          }
+        }
+      }
+    };
+
+    await expect(
+      service.trigger('test.event', complexData)
+    ).resolves.not.toThrow();
+  });
+
+  it('rejects at exact boundary when payload equals limit', async () => {
+    const service = new WebhookService();
+    // Create payload exactly at the limit (10KB)
+    const boundaryData = { event: 'test', data: 'x'.repeat(10240 - JSON.stringify({ event: 'test', data: '' }).length) };
+
+    await expect(
+      service.trigger('test.event', boundaryData)
+    ).rejects.toThrow('Webhook payload size');
   });
 });
